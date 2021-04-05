@@ -1,0 +1,132 @@
+---
+title: "assn 2"
+author: "Meag Tessmann"
+date: "6/2/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(rvest)
+library(tidyverse)
+library(quanteda)
+# install.packages("PetfindeR")
+library(PetfindeR)
+library(httr)
+library(jsonlite)
+
+
+
+```
+
+
+``` {r}
+
+# Scrap headers and paragraphs from https://fourminutebooks.com/nudge-summary/ and create a word cloud
+
+nudge <- read_html("https://fourminutebooks.com/nudge-summary/")
+
+nudge_text <- nudge %>% 
+  html_nodes("p, h2") %>% 
+  html_text()
+
+# # can use css selectors to do multipke
+# nudge_h2 <- nudge %>% 
+#   html_nodes("h2") %>% 
+#   html_text()
+# nudge_para <- as.data.frame(nudge_para)
+# colnames(nudge_para) = "text"
+# 
+# nudge_h2 <- as.data.frame(nudge_h2)
+# colnames(nudge_h2) = "text"
+# 
+# nudge_text <- rbind(para, h2)
+
+nudge_dfm <- tokens(
+  nudge_text, 
+  what='word', 
+  remove_punct=TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE, 
+  split_hyphens = TRUE) %>% 
+  dfm(remove = stopwords('english'))
+
+textplot_wordcloud(
+  nudge_dfm,
+  min_size = 0.5,
+  max_size = 4,
+  min_count = 3,
+  max_words = 500,
+  color = "darkblue",
+  font = NULL,
+  adjust = 0,
+  rotation = 0.1,
+  random_order = FALSE,
+  random_color = FALSE,
+  ordered_color = FALSE,
+  labelcolor = "gray20",
+  labelsize = 1.5,
+  labeloffset = 0,
+  fixed_aspect = TRUE,
+  comparison = FALSE
+)
+
+
+```
+
+
+``` {r}
+
+surnames <- read_html('https://en.wikipedia.org/wiki/List_of_most_common_surnames_in_North_America')
+
+surnames_nodes <- surnames %>%
+  html_nodes(xpath='//*[@id="mw-content-text"]/div/table[8]/tbody/tr/td[1]/a') 
+
+surnames_table <- surnames %>%
+  html_nodes(xpath='//*[@id="mw-content-text"]/div/table[8]') %>% 
+  html_table()
+
+surnames_table
+```
+
+
+``` {r}
+
+api_key <- 'AGOxbHl3d5K3RkC59DmHczIqUN5FPPCncxWDXgqwtMCffWQXgN'
+api_secret <- 'jKbYtgXeCSj0jYNjgVGhZYaaaypCe6snIkjuYcLF'
+
+pf = Petfinder(api_key, api_secret)
+
+# find all dog breeds
+dog_breeds = pf$breeds('dog')
+dog_breeds
+
+# find adoptable dogs within 5 miles
+adoptable = pf$animals(animal_type = 'dog', status = 'adoptable', location='Salt Lake City, UT', distance = 5)
+
+adoptable
+
+
+
+```
+
+
+``` {r}
+
+base_url <- "https://superheroapi.com/api/267824684359706/527" # Code 620 is spiderman, 267824684359706 is access token
+
+prof_x <- GET(base_url) # search term -
+prof_x[["content"]]
+
+# spiderman$content
+data = fromJSON(rawToChar(prof_x$content))
+
+data$powerstats
+
+```
+
+
+
+
+

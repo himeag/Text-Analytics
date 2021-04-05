@@ -1,0 +1,1121 @@
+---
+title: "MKTG 6640 Final Project"
+author: "Meag Tessmann"
+date: "7/5/2020"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+
+---
+
+```{r libraries, echo=T, error=F, warning=F, message=F}
+
+library(tidyverse)
+library(skimr)
+library(quanteda)
+library(quanteda.textmodels)
+library(jsonlite)
+library(data.table)
+library(stringr)
+library(caret)
+library(knitr)
+library(e1071)
+library(irlba)
+library(randomForest)
+library(doSNOW)
+library(cleanNLP)
+
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+
+```
+
+
+# Data prep
+
+Data came in from a json file and converted to a data frame on import. To clean, I make the categorical variabled into factors, add a unique review id, spread an array variable of helpful votes and total votes into two separate columns, and create a target variable for the prediction section of if a review has _any_ helpful votes.
+
+``` {r load-data, echo=T, error=F, warning=F, message=F}
+
+# import data into data.frame
+reviews_raw <- stream_in(file("reviews_Tools_and_Home_Improvement_5.json"))
+
+
+
+```
+
+``` {r add-variables-and-clean}
+# add a review_id unique variable and unnest the helpful & total votes from a list to separate columns, rename 
+reviews <- reviews_raw %>% 
+  select(-c(asin, reviewerName, summary, reviewTime)) %>% 
+  mutate(
+    review_id = seq.int(nrow(reviews_raw)),
+    rating = factor(overall)
+  ) %>%
+  unnest(helpful) %>%
+  group_by(review_id) %>%
+  mutate(col=seq_along(review_id)) %>%
+  spread(key=col, value=helpful) %>% 
+  rename(
+    helpful_votes = `1`,
+    total_votes = `2`
+  )  
+
+reviews <- reviews %>% 
+    mutate(
+    isHelpful = factor(ifelse(helpful_votes>0,1,0)),
+    word_count = str_count(reviewText, pattern = "([A-Z]|[a-z])\\w+"),
+    exclaim_count = str_count(reviewText, pattern = "!"),
+    question_count = str_count(reviewText, pattern = "\\?"),
+    char_count = str_length(reviewText),
+    utc_time = lubridate::as_datetime(unixReviewTime),
+    time_month = factor(lubridate::month(utc_time), ordered = TRUE, levels = c('1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'))
+  )
+
+
+### 
+# Note:  I was going to split observations on sentences, but ran out of time. Keeping it here for future reference
+###
+# number of words in all-caps
+# reviews_split <- reviews %>%
+#   mutate(
+#     reviewText = str_split(reviewText, '[\\.][!][\\?]')
+#   ) %>% 
+#   unnest(reviewText).... DNF
+
+
+
+
+
+```
+
+
+#### Reduce the dataset
+
+For some of the more computationally intense functions, some of the functions were running out of memory. I choose to reduce the dataset to focus on learning and practicing concepts. 
+
+```{r reduced-data-sets}
+
+
+## My intention is for this notebook to be a learning exercise. The original dataset was running out of memory during various functions, so reducing dataset arbitrarily from 134,476 to 30,000 observations.
+
+# 30,000 Obs for POS tagging
+reviews.reduced.indexes <- createDataPartition(reviews$isHelpful, times=1, p=(30000/nrow(reviews)), list=FALSE)
+reduced.30 <- reviews[reviews.reduced.indexes,]
+
+
+```
+
+# Exploratory Data Analysis
+
+Checking for missing observations and plotting a few initial plots to get a feel for helpful and rating distribution.
+
+``` {r graphs}
+
+# Check missing data - no teview text missing
+which(!complete.cases(reviews$reviewText))
+
+# Rating text length seem to follow similar curve among all ratings
+ggplot(reviews, aes(str_length(reviewText), fill=rating)) + 
+  geom_histogram(binwidth=10)  +
+  xlim(0,4000) +
+  ggtitle('Review length ~ Rating')
+
+# Unhelpful reviews do follow a different trajectory than helpful reviews. It appears there's a proportionally larger amount of helpful reviews with larger char length.
+ggplot(reviews, aes(str_length(reviewText), fill=isHelpful)) + 
+  geom_histogram(binwidth=10)  +
+  xlim(0,4000) +
+  ggtitle('Review length ~ Helpfulness')
+
+# similar finding with word count
+ggplot(reviews, aes(word_count, fill=isHelpful)) + 
+  geom_histogram(binwidth=5)  +
+  xlim(0,650) +
+  ggtitle('Word count ~ Helpfulness')
+
+# 
+ggplot(reviews, aes(exclaim_count, fill=isHelpful)) + 
+  geom_histogram(binwidth=1, position = 'dodge')  +
+  xlim(0,10)  +
+  ggtitle('Exclaimation count ~ Helpfulness')
+
+# 
+ggplot(reviews, aes(question_count, fill=isHelpful)) + 
+  geom_histogram(binwidth=1, position = 'dodge')  +
+  xlim(0,10) +
+  ggtitle('Question mark count ~ Helpfulness')
+
+
+# Most helpful reviews have under 10 votes, with a really long tail.
+ggplot(reviews, aes(helpful_votes)) + 
+  geom_histogram(binwidth=1)  +
+  xlim(0,50) +
+  ggtitle('Histogram of total helpful votes per review')
+
+# While average character per word counts are about the same, unhelpful reviews have a great spread of outliers.
+ggplot(reviews, aes((reviews$char_count)/(reviews$word_count), fill=isHelpful)) + 
+  geom_boxplot() + 
+  xlim(0,15)+
+  ggtitle('Average word length')
+
+# It appears fall reviews are more likely to be helpful. It would be interesting to see if a correlation exists between purchase amount within the cateogry and amount of reviews which are marked helpful.  
+ggplot(reviews, aes(time_month, fill=isHelpful)) + 
+  geom_histogram(stat='count')  +
+  ggtitle('Helpfulness ~ Month')
+
+chisq.test(reviews$isHelpful, reviews$time_month)
+
+
+```
+
+#### Create corpus & dfm for further EDA
+
+``` {r create-corpus}
+
+
+# Create corpus to use in next couple sections, and add a couple useful variables
+reviews.corpus <- corpus(reviews$reviewText)
+docvars(reviews.corpus, "review_id") <- reviews$review_id
+docvars(reviews.corpus, 'rating') <- reviews$rating
+docvars(reviews.corpus, 'reviewer') <- reviews$reviewerID
+docvars(reviews.corpus, 'helpful') <- reviews$helpful_votes
+docvars(reviews.corpus, 'isHelpful') <- reviews$isHelpful
+docvars(reviews.corpus, 'word_count') <- reviews$word_count
+
+
+
+# summary(reviews.corpus)
+
+# create dfm
+reviews.dfm <- dfm(reviews.corpus, remove=stopwords("english"), remove_punct=TRUE, remove_symbols=TRUE, remove_separators=TRUE)
+reviews.tfidf <-dfm_tfidf(reviews.dfm)
+
+```
+
+
+## Word Clouds for initial intuition
+
+
+``` {r word-clouds}
+
+set.seed(100)
+
+
+# word clous of top 100 words
+
+# Nothing sticks out as too big or important here - the top 15/20 words are pretty generic. Interesting that s and t are common - i'm assuming these are posession and contraction indicating negativity. 
+textplot_wordcloud(reviews.dfm, min_count = 6, random_order = FALSE,
+                   rotation = .25, 
+                   color = RColorBrewer::brewer.pal(8,"Dark2"))
+
+
+# word cloud, sep on helpfulness
+# Reviews which do not have a helpful vote up use generic adjectives like great, light, easy. Those reviews which had at least one helpful vote referenced parts of the tool or aspects of the product such as blade, edge, guide, lumens, fence, plate, motor, router, base. I have a hypothesis that these reviews tend to reference specific experiences with the product. 
+
+reviews.dfm_helpful <- dfm(reviews.corpus, groups='isHelpful', remove=stopwords("english"), remove_punct=TRUE, remove_numbers=TRUE, remove_separators=TRUE)
+
+textplot_wordcloud(reviews.dfm_helpful, comparison = TRUE, max_words = 350, color = RColorBrewer::brewer.pal(8,"Dark2"))
+
+
+
+# word cloud, sep on rating
+# Nothign too surprising here - reviews with high ratings are associated with ease of use, bad reviews are associted with things breaking, returning, and being a waste of money.
+reviews.dfm_ratings <- dfm(reviews.corpus, groups='rating', remove=stopwords("english"), remove_punct=TRUE, remove_numbers=TRUE, remove_separators=TRUE)
+
+textplot_wordcloud(reviews.dfm_ratings, comparison = TRUE, max_words = 150)
+
+
+```
+## Keyness
+
+``` {r keyness}
+
+# It looks like keyed words with unhelpful reviews are adjectives and those keyed to helpful reviews are nouns. Will use POS to explore this further.
+reviews.keyness <- textstat_keyness(reviews.dfm, target=reviews$isHelpful==1)
+textplot_keyness(reviews.keyness, margin = 0.2, n = 10)
+
+```
+
+
+## Part of Speech tagging
+
+``` {r pos-tagging, results='hide'}
+
+
+# 30,000 Obs for POS tagging
+reviews.reduced.indexes <- createDataPartition(reviews$isHelpful, times=1, p=(30000/nrow(reviews)), list=FALSE)
+reduced.30 <- reviews[reviews.reduced.indexes,]
+
+
+## Trying a new dictionary for practice. This time will do percent of positive and negative equalling 1
+
+start.time <- Sys.time()
+cl <- makeCluster(3, type='SOCK')
+registerDoSNOW(cl)
+
+
+# using super reduced dataset for pos tagging
+cnlp_init_udpipe()
+reviews.pos <- cnlp_annotate(reduced.30$reviewText)
+
+stopCluster(cl)
+total.time <- Sys.time() - start.time
+total.time
+```
+
+``` {r}
+
+total.time
+
+reduced.30$doc_id = seq.int(nrow(reduced.30))
+
+pos.docs <- left_join(reviews.pos$token,reduced.30, by='doc_id') %>% 
+  select(c(doc_id, token_with_ws, upos, xpos, feats, relation, reviewerID, rating, helpful_votes, isHelpful))
+
+
+# Even though proportionally, there's more unhelpful reviews in the dataset, there are proportionally a lot more identified pos in helpful reviews. 
+round(prop.table(table(reduced.30$isHelpful)), 3)
+pos.docs <- pos.docs %>% 
+  mutate(
+    upos = factor(upos),
+    xpos = factor(xpos)
+  ) 
+
+pos.docs %>% 
+  ggplot(aes(upos, fill=isHelpful)) + 
+  geom_bar(position = "dodge2") + 
+  ggtitle("Count of POS ~ helpfulness")
+
+## chi-squared table for expected values??? based on length?
+
+table(pos.docs$isHelpful, pos.docs$upos)
+
+```
+
+
+
+``` {r}
+
+# any unexpected outliers?
+ggplot(reduced.30, aes(word_count, char_count))+
+  geom_point()
+
+summary(reduced.30)
+```
+
+#### Plot POS relationships
+
+``` {r}
+
+pos.totals <- pos.docs %>% 
+  group_by(doc_id) %>% 
+  count(upos) %>% 
+  pivot_wider(names_from = upos, values_from=n, values_fill=0) %>% 
+  rename(review_id = doc_id)
+
+reduced.30.pos <- left_join(reduced.30, pos.totals, on=review_id)
+
+reduced.30.pos.vars <- reduced.30.pos %>% 
+  mutate(
+    noun_verb = NOUN/VERB,
+    noun_adj = NOUN/ADJ,
+    adj_verb = ADJ/VERB,
+    noun_len = NOUN/word_count,
+    verb_len = VERB/word_count,
+    adj_len = ADJ/word_count,
+    word_total = sum(reduced.30.pos[16:32])
+  )
+
+ggplot(reduced.30.pos.vars, aes(noun_verb, fill=isHelpful)) +
+  geom_histogram(binwidth=.1) + 
+  ggtitle("Histogram of Noun:Verb ratio per review")
+
+ggplot(reduced.30.pos.vars, aes(noun_adj, fill=isHelpful)) +
+  geom_histogram(binwidth=.5)+ 
+  ggtitle("Histogram of Noun:Adjective ratio per review")
+
+
+ggplot(reduced.30.pos.vars, aes(adj_verb, fill=isHelpful)) +
+  geom_histogram(binwidth=.2)+ 
+  ggtitle("Histogram of Adjective:Verb ratio per review")
+
+
+ggplot(reduced.30.pos.vars, aes(noun_len, fill=isHelpful)) +
+  geom_histogram(binwidth=.01) + 
+  xlim(0,2.5)+ 
+  ggtitle("Histogram of Noun:Review-Length Proportion per review")
+
+
+ggplot(reduced.30.pos.vars, aes(verb_len, fill=isHelpful)) +
+  geom_histogram(binwidth=.02) + 
+  xlim(0,2)+ 
+  ggtitle("Histogram of Verb:Review-Length Proportion per review")
+
+
+ggplot(reduced.30.pos.vars, aes(adj_len, fill=isHelpful)) +
+  geom_histogram(binwidth=.02) + 
+  xlim(0,1)+ 
+  ggtitle("Histogram of Adj::Review-Length Proportion per review")
+
+colnames(reduced.30.pos.vars[14])
+
+```
+
+
+
+
+## Sentiment Analysis
+Is sentiment generally on trend with ratings?
+
+``` {r sentiment}
+
+# apply quanteda's sentiment dictionary to dataset
+# create tokens of reviews
+reviews_tokens = tokens(reduced.30$reviewText, remove_punct = TRUE)
+
+# apply sentiment dictionary provided by quanteda package
+reviews_tokens_lsd <- tokens_lookup(reviews_tokens, dictionary =  data_dictionary_LSD2015)
+
+# create weighted dfm to account for different number of reviews per reviewer
+dfm_lsd <- dfm(reviews_tokens_lsd)
+dfm_lsd_weighted <- dfm_weight(dfm_lsd, scheme='prop')
+
+# convert to joinable datafram
+dfm_lsd_weighted_df <- setDT(as.data.frame(dfm_lsd_weighted), keep.rownames='docs')
+
+
+# join sentiment count and review dataset
+reviews_sentiment <- reduced.30 %>% 
+  mutate(
+    docs = paste0("text", review_id)
+  )  %>%
+   inner_join(dfm_lsd_weighted_df, by=c('docs'='document'), copy=TRUE)
+
+
+# plot ratings by positive sentiment count
+# Helpful reiews are skewing less positive. I can imagine reviews that are super cheery and praising do not offer enough insight for someone to click a button saying it was helpful. This leads me to think that Amazon should not necessarily show all the positive and negative reviews, especailly if they're not providing 'value' - and instead first show summary ratings and reviews which are helpful and use progressive disclosure to show those reviews which are more generic.
+reviews_sentiment %>% 
+  ggplot(aes(isHelpful, positive)) + 
+  geom_boxplot()  +
+  ggtitle('Percent of Positive Sentiment in Review if they were helpful or not')
+
+# Same with the negative sentimental reviews - helpful reviews seem to be more 'middle of the line' while those with strong sentiment in either direction are not seen as helpful. This intuitively makes sense because those who are on teh extremes are less likely (imo) to be realistic - describing both pros and cons.
+# plot ratings by negative sentiment count 
+reviews_sentiment %>% 
+  arrange(isHelpful) %>% 
+  ggplot(aes(isHelpful, negative)) + 
+  geom_boxplot() +
+  ggtitle('Percent of Negative Sentiment in Review  if they were helpful or not')
+
+# I expected to see a stronger correlation here, but I don't think this plot is working to either support or debunct that hypothesis
+reviews_sentiment %>% 
+  ggplot(aes(positive, negative)) + 
+  geom_point() +
+  facet_wrap(~isHelpful) +
+  ggtitle('Percent of Positive and Negative Sentiment in Reviews, Faceted by Rating')
+
+
+```
+
+
+``` {r rating-sentiment}
+
+### This section was from when I was initially focused on ratings. IT's still interesting, so keeping it.
+
+# # plot ratings by positive sentiment count 
+# reviews_sentiment %>% 
+#   mutate(
+#     overall = factor(overall, ordered = TRUE, levels=c('1', '2', '3', '4', '5'))
+#   ) %>% 
+#   ggplot(aes(overall, positive)) + 
+#   geom_boxplot()  +
+#   ggtitle('Percent of Positive Sentiment in Review ~ Rating')
+# 
+# # plot ratings by negative sentiment count 
+# reviews_sentiment %>% 
+#   mutate(
+#     overall = factor(overall, ordered = TRUE, levels=c('1', '2', '3', '4', '5'))
+#   ) %>%
+#   arrange(overall) %>% 
+#   ggplot(aes(overall, negative)) + 
+#   geom_boxplot() +
+#   ggtitle('Percent of Negative Sentiment in Review ~ Rating')
+# 
+# reviews_sentiment %>% 
+#   mutate(
+#     overall = factor(overall, ordered = TRUE, levels=c('1', '2', '3', '4', '5'))
+#   ) %>% 
+#   ggplot(aes(positive, negative)) + 
+#   geom_point() +
+#   facet_wrap(~overall) +
+#   ggtitle('Percent of Positive and Negative Sentiment in Reviews, Faceted by Rating')
+
+
+
+
+# TODO: 
+
+```
+
+#### Does month affect sentiment?
+
+
+``` {r}
+
+
+# plot ratings by positive sentiment count 
+reviews_sentiment %>% 
+  ggplot(aes(time_month, positive)) + 
+  geom_boxplot()  +
+  ggtitle('Percent of Positive Sentiment in Review ~ month')
+
+# plot ratings by negative sentiment count 
+reviews_sentiment %>% 
+  ggplot(aes(time_month, negative)) + 
+  geom_boxplot() +
+  ggtitle('Percent of Negative Sentiment in Review ~ month')
+
+```
+
+
+#### Individual Reviewer Sentiment
+
+``` {r}
+
+### TODO: Do individual reviews tend to be either positive or negative across all reviews?
+
+reviewer_stats <- reviews_sentiment %>% 
+  group_by(reviewerID) %>% 
+  summarize(
+    total = n(),
+    rating_avg = mean(overall),
+    rating_std = sd(overall),
+    sent_pos_avg = mean(positive),
+    sent_pos_std = sd(positive),
+    sent_neg_avg = mean(negative),
+    sent_neg_std = sd(negative)
+  )
+
+summary(reviewer_stats)
+
+
+reviewer_stats %>%
+  ggplot(aes(rating_avg, rating_std, color=sent_pos_avg)) +
+  geom_point() +
+  ggtitle('Percent of Negative Sentiment in Review ~ month')
+
+# narrow down to single rating averages
+reviewer_stats %>%
+  filter(rating_avg>4) %>% 
+  ggplot(aes(rating_avg, rating_std, color=sent_pos_avg)) +
+  geom_point() +
+  ggtitle('Percent of Negative Sentiment in Review ~ month')
+
+# hypothesis: those who have a lower average rating but more positive reviews will have a larger standard deviation
+reviewer_stats %>%
+  filter(rating_avg<2.5) %>% 
+  ggplot(aes(rating_avg, rating_std, color=sent_pos_avg, size=total)) +
+  geom_point() +
+  ggtitle('Percent of Negative Sentiment in Review ~ month')
+
+# hypothesis: positive sentiment and rating standard deviation are correlated when rating average is low
+
+low_ratings_sentiment <- reviewer_stats %>% 
+  filter(rating_avg < 2)
+
+# reviewer_stats_lm <- train(rating_avg~., reviewer_stats, method='lm')
+
+```
+
+
+
+
+# Model Selection
+
+Whether a review is helpful or not is important information for a product. Using a predictive model, we can filter new reviews which we think will be helpful up to the top for potential customers to get answers faster or think of things they didn't consider. In this section, I'll create test/train sets to compare several models predictability on whether a review receives at least 1 helpful rating. 
+
+
+#### Create train/test sets
+
+``` {r}
+
+# create the target variable first, to ensure stratification
+reviews.strat <- reviews_raw %>% 
+  mutate(
+    review_id = seq.int(nrow(reviews_raw)),
+  ) %>%
+  unnest(helpful) %>%
+  group_by(review_id) %>%
+  mutate(col=seq_along(review_id)) %>%
+  spread(key=col, value=helpful) %>% 
+  rename(
+    helpful_votes = `1`, 
+    total_votes = `2`
+  ) %>% 
+  mutate(
+    isHelpful = factor(ifelse(helpful_votes>5,1,0))
+  ) %>% 
+  select(-c(reviewerID, reviewerName, asin, summary, review_id))
+      
+
+## Using even more reduced set for POS tagging, SVM and RF training...
+# 4,000 for model training
+set.seed(345)
+reviews.reduced.indexes <- createDataPartition(reviews.strat$isHelpful, times=1, p=(4000/nrow(reviews)), list=FALSE)
+reduced.4 <- reviews.strat[reviews.reduced.indexes,]
+
+
+# separate to test & train sets
+set.seed(345)
+indexes <- createDataPartition(reduced.4$isHelpful, times=1, p=.7, list=FALSE)
+
+train <- reduced.4[indexes,]
+test <- reduced.4[-indexes,] 
+
+# check for target variable distribution
+round(prop.table(table(reduced.4$isHelpful)), 3)
+round(prop.table(table(train$isHelpful)), 3)
+round(prop.table(table(test$isHelpful)), 3)
+
+round((table(reduced.4$isHelpful)), 3)
+round((table(train$isHelpful)), 3)
+round((table(test$isHelpful)), 3)
+
+test.labels <- test$isHelpful
+train.labels <- train$isHelpful
+
+test <- test %>% 
+  select(-c(isHelpful, helpful_votes, total_votes))
+
+```
+
+#### Prep Test set for model training
+
+``` {r}
+
+####
+# Future things to try:  
+# • convert numbers to words
+# • if twitter, dont remove symbols
+# • remove non-english words
+# • cross-reference translation dictionary, especially with location-specfic
+# • potentially correct common misspelling
+####
+
+train.pre <- train %>% 
+  mutate(
+    rating = factor(overall),
+    utc_time = lubridate::as_datetime(unixReviewTime),
+    time_month = factor(lubridate::month(utc_time), ordered = TRUE, levels = c('1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12')),
+    word_count = str_count(reviewText, pattern = "([A-Z]|[a-z])\\w+"),
+    exclaim_count = str_count(reviewText, pattern = "!"),
+    question_count = str_count(reviewText, pattern = "\\?"),
+    char_count = str_length(reviewText),
+    char_per_word = ifelse( word_count==0, 0,(char_count)/(word_count))
+  ) %>% 
+  select(-c(utc_time, unixReviewTime))
+
+
+
+# Manually changing punctuation 
+## Initially used this, but found it to hurt performance quite a bit
+train.punct <- train %>% 
+  mutate(
+    reviewText = str_replace_all(reviewText, '\\.', ' punct.period '), 
+    reviewText = str_replace_all(reviewText, '\\,', ' punct.comma '),
+    reviewText = str_replace_all(reviewText, '\\;', ' punct.semicolon '),
+    reviewText = str_replace_all(reviewText, '\\:', ' punct.colon '),
+    reviewText = str_replace_all(reviewText, '\\[', ' punct.bracket '),
+    reviewText = str_replace_all(reviewText, '\\]', ' punct.bracket '),
+    reviewText = str_replace_all(reviewText, '\\(', ' punct.paren '),
+    reviewText = str_replace_all(reviewText, '\\)', ' punct.paren '),
+    reviewText = str_replace_all(reviewText, '\\-', ' punct.dash '),
+    reviewText = str_replace_all(reviewText, '\\—', ' punct.dash '),
+    reviewText = str_replace_all(reviewText, '\\+', ' punct.plus '),
+    reviewText = str_replace_all(reviewText, '\\=', ' punct.equal '),
+    reviewText = str_replace_all(reviewText, '\\!', ' punct.bang '),
+    reviewText = str_replace_all(reviewText, '\\@', ' punct.at '),
+    reviewText = str_replace_all(reviewText, '\\#', ' punct.hash '),
+    reviewText = str_replace_all(reviewText, '\\?', ' punct.question '),
+    reviewText = str_replace_all(reviewText, '\\$', ' punct.dollar '),
+    reviewText = str_replace_all(reviewText, '\\%', ' punct.percent '),
+    reviewText = str_replace_all(reviewText, '\\&', ' punct.amp '),
+    reviewText = str_replace_all(reviewText, '\\*', ' punct.aster '),
+    reviewText = str_replace_all(reviewText, '\\\'', ' punct.quot '),
+    reviewText = str_replace_all(reviewText, '\\"', ' punct.quot '),
+    reviewText = str_replace_all(reviewText, '\\`', ' punct.quot ')
+  )
+
+
+
+# create new token set for model training and dfm
+train.tokens <- tokens(train$reviewText, 
+                       what = "word",
+                       remove_numbers = TRUE,
+                       remove_symbols = TRUE, 
+                       remove_punct = TRUE,
+                       split_hyphens = TRUE,
+                       remove_separators = TRUE
+                       )
+
+train.tokens.dfm <- train.tokens %>% 
+  tokens_tolower() %>% 
+  tokens_remove(stopwords(source = 'smart')) %>% 
+  tokens_wordstem(language = 'english') %>% 
+  dfm()
+
+train.tfidf <- train.tokens.dfm %>% 
+  dfm_trim(min_termfreq = 10, min_docfreq = 2) %>% 
+  dfm_tfidf()
+
+train.tfidf.df <- cbind(Label=train$isHelpful, data.frame(train.tfidf))
+names(train.tfidf.df) <- make.names(names(train.tfidf.df))
+
+
+train.tokens.matrix <- as.matrix(train.tokens.dfm)
+train.tokens.df <- cbind(Label = train$isHelpful, convert(train.tokens.dfm, to='data.frame'))
+
+names(train.tokens.df) <- make.names(names(train.tokens.df))
+
+
+start.time <- Sys.time()
+
+train.lsa <- irlba(t(train.tfidf), nv=300, maxit=600)
+train.svd <- data.frame(Label = train$isHelpful, train.lsa$v)
+
+total.time <- Sys.time() - start.time
+total.time
+
+# save for test dataset 
+sigma.inverse <- 1/train.lsa$d
+u.transpose <- t(train.lsa$u)
+
+
+dim(u.transpose)
+
+which(!complete.cases(train.svd))
+
+
+## Adding engineered features to separate training set
+
+train.tfidf.df.eng <- train.tfidf.df %>% 
+  mutate(
+    month = train.pre$time_month,
+    word_count = train.pre$word_count,
+    exclaim_count = train.pre$exclaim_count,
+    question_count = train.pre$question_count,
+    char_count = train.pre$char_count,
+    char_per_word = train.pre$char_per_word,
+    rating = train.pre$rating
+  )
+
+train.svd.eng <- train.svd %>% 
+  mutate(
+    month = train.pre$time_month,
+    word_count = train.pre$word_count,
+    exclaim_count = train.pre$exclaim_count,
+    question_count = train.pre$question_count,
+    char_count = train.pre$char_count,
+    char_per_word = train.pre$char_per_word,
+    rating = train.pre$rating
+  )
+
+
+
+```
+
+``` {r pos-train-hold}
+
+# 
+# 
+# # apply quanteda's sentiment dictionary to dataset
+# # create tokens of reviews
+# train.tokens = tokens(train$reviewText, remove_punct = TRUE)
+# 
+# # apply sentiment dictionary provided by quanteda package
+# train.tokens.lsd <- tokens_lookup(train.tokens, dictionary =  data_dictionary_LSD2015)
+# 
+# # create weighted dfm to account for different number of reviews per reviewer
+# train.dfm.lsd <- dfm(train.tokens.lsd)
+# train.dfm.lsd.weighted <- dfm_weight(train.dfm.lsd, scheme='prop')
+# 
+# # convert to joinable datafram
+# train.dfm.lsd.weighted.df <- setDT(as.data.frame(train.dfm.lsd.weighted), keep.rownames='docs')
+# train.dfm.lsd.weighted.df <- train.dfm.lsd.weighted.df %>% 
+#   mutate(
+#     docs = 
+#   )
+# 
+# 
+# # join sentiment count and review dataset
+# train.sentiment <- train 
+#   mutate(
+#     docs = paste0("text", review_id)
+#   )  %>%
+#    inner_join(dfm_lsd_weighted_df, by=c('docs'='document'), copy=TRUE)
+# 
+#   
+  
+```
+
+
+
+## Train base models
+
+####  Naive Bayes model
+``` {r nb-model}
+
+set.seed(5678)
+
+model.nb <- textmodel_nb(train.tokens.dfm, train$isHelpful)
+summary(model.nb)
+
+```
+
+####  SVM 
+``` {r svm}
+
+
+set.seed(5678)
+
+cv.folds <- createMultiFolds(train.svd$Label, k=10, times=2)
+cv.cntrl <- trainControl(method = 'repeatedcv', number=10, repeats=2, index=cv.folds)
+
+start.time <- Sys.time()
+
+cl <- makeCluster(3, type='SOCK')
+registerDoSNOW(cl)
+
+svm.linear <- train(Label ~ ., 
+                    data=train.svd, 
+                    method='svmLinear', 
+                    preProcess = c("center", "scale"),
+                    trControl = cv.cntrl, tuneLength=7,
+                    na.action=na.exclude
+                    )
+
+on.exit(stopCluster(cl))
+   
+total.time <- Sys.time() - start.time
+total.time
+
+svm.linear
+
+```
+
+#### Single Decision Tree Random Forrest
+
+``` {r rpart}
+set.seed(5678)
+
+start.time <- Sys.time()
+
+cl <- makeCluster(3, type='SOCK')
+registerDoSNOW(cl)
+
+rpart.cv <- train(Label ~ ., 
+                    data=train.tfidf.df, 
+                    method='rpart', 
+                    trControl = cv.cntrl, tuneLength=7
+                    )
+
+stopCluster(cl)
+
+total.time <- Sys.time() - start.time
+total.time
+
+rpart.cv
+
+```
+
+#### Random Forrest
+
+``` {r rand-forrest}
+
+###
+# Including code here, but not evaluating due to hardware performance
+####
+
+#set.seed(5678)
+# 
+# start.time <- Sys.time()
+# 
+# cl <- makeCluster(3, type='SOCK')
+# registerDoSNOW(cl)
+# 
+# randforr.cv <- train(Label ~ ., 
+#                     data=train.svd, 
+#                     method='rf', 
+#                     trControl = cv.cntrl, tuneLength=7
+#                     )
+# 
+# stopCluster(cl)
+# 
+# total.time <- Sys.time() - start.time
+# total.time
+# 
+# randforr.cv
+# 
+# varImpPlot(randforr.cv$finalModel)
+
+```
+
+
+
+## Train new models with engineered features
+
+#### SVM 
+``` {r svm.eng}
+
+
+set.seed(5678)
+
+cv.folds <- createMultiFolds(train.svd$Label, k=10, times=2)
+cv.cntrl <- trainControl(method = 'repeatedcv', number=10, repeats=2, index=cv.folds)
+
+start.time <- Sys.time()
+
+cl <- makeCluster(3, type='SOCK')
+registerDoSNOW(cl)
+
+svm.linear.eng <- train(Label ~ ., 
+                    data=train.svd.eng, 
+                    method='svmLinear', 
+                    preProcess = c("center", "scale"),
+                    trControl = cv.cntrl, tuneLength=7,
+                    na.action=na.exclude
+                    )
+
+on.exit(stopCluster(cl))
+   
+total.time <- Sys.time() - start.time
+total.time
+
+svm.linear.eng
+
+```
+
+#### Single Decision Tree Random Forrest
+
+``` {r rpart.eng}
+set.seed(5678)
+
+start.time <- Sys.time()
+
+cl <- makeCluster(3, type='SOCK')
+registerDoSNOW(cl)
+
+rpart.cv.eng <- train(Label ~ ., 
+                    data=train.tfidf.df.eng, 
+                    method='rpart', 
+                    trControl = cv.cntrl, tuneLength=7
+                    )
+
+stopCluster(cl)
+
+total.time <- Sys.time() - start.time
+total.time
+
+rpart.cv.eng
+
+```
+
+
+
+
+## Prep Test Set
+
+``` {r test-set-prep}
+
+
+test.pre <- test %>% 
+  mutate(
+    rating = factor(overall),
+    utc_time = lubridate::as_datetime(unixReviewTime),
+    time_month = factor(lubridate::month(utc_time), ordered = TRUE, levels = c('1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12')),
+    word_count = str_count(reviewText, pattern = "([A-Z]|[a-z])\\w+"),
+    exclaim_count = str_count(reviewText, pattern = "!"),
+    question_count = str_count(reviewText, pattern = "\\?"),
+    char_count = str_length(reviewText),
+    char_per_word = ifelse( is.na((char_count)/(word_count)), 0,(char_count)/(word_count))
+  ) %>% 
+  select(-c(utc_time, unixReviewTime))
+
+
+# Manually changing punctuation 
+test.punct <- test %>% 
+  mutate(
+    reviewText = str_replace_all(reviewText, '\\.', ' punct.period '), 
+    reviewText = str_replace_all(reviewText, '\\,', ' punct.comma '),
+    reviewText = str_replace_all(reviewText, '\\;', ' punct.semicolon '),
+    reviewText = str_replace_all(reviewText, '\\:', ' punct.colon '),
+    reviewText = str_replace_all(reviewText, '\\[', ' punct.bracket '),
+    reviewText = str_replace_all(reviewText, '\\]', ' punct.bracket '),
+    reviewText = str_replace_all(reviewText, '\\(', ' punct.paren '),
+    reviewText = str_replace_all(reviewText, '\\)', ' punct.paren '),
+    reviewText = str_replace_all(reviewText, '\\-', ' punct.dash '),
+    reviewText = str_replace_all(reviewText, '\\—', ' punct.dash '),
+    reviewText = str_replace_all(reviewText, '\\+', ' punct.plus '),
+    reviewText = str_replace_all(reviewText, '\\=', ' punct.equal '),
+    reviewText = str_replace_all(reviewText, '\\!', ' punct.bang '),
+    reviewText = str_replace_all(reviewText, '\\@', ' punct.at '),
+    reviewText = str_replace_all(reviewText, '\\#', ' punct.hash '),
+    reviewText = str_replace_all(reviewText, '\\?', ' punct.question '),
+    reviewText = str_replace_all(reviewText, '\\$', ' punct.dollar '),
+    reviewText = str_replace_all(reviewText, '\\%', ' punct.percent '),
+    reviewText = str_replace_all(reviewText, '\\&', ' punct.amp '),
+    reviewText = str_replace_all(reviewText, '\\*', ' punct.aster '),
+    reviewText = str_replace_all(reviewText, '\\\'', ' punct.quot '),
+    reviewText = str_replace_all(reviewText, '\\"', ' punct.quot '),
+    reviewText = str_replace_all(reviewText, '\\`', ' punct.quot ')
+  )
+
+
+
+
+# create new token set for model training and dfm
+test.tokens <- tokens(test$reviewText, 
+                       what = "word",
+                       remove_numbers = TRUE,
+                       remove_symbols = TRUE, 
+                       remove_punct = TRUE,
+                       split_hyphens = TRUE,
+                       remove_separators = TRUE
+                       )
+
+test.tokens.dfm <- test.tokens %>% 
+  tokens_tolower() %>% 
+  tokens_remove(stopwords(source = 'smart')) %>% 
+  tokens_wordstem(language = 'english') %>% 
+  dfm() 
+
+
+test.tfidf <-  test.tokens.dfm %>%
+  dfm_trim(min_termfreq = 10, min_docfreq = 2) %>%
+  dfm_tfidf() %>% 
+  dfm_select(pattern=train.tfidf, selection="keep")
+
+test.tfidf.df <- data.frame(test.tfidf)
+names(test.tfidf.df) <- make.names(names(test.tfidf.df))
+
+
+
+test.tokens.matrix <- as.matrix(test.tokens.dfm)
+test.tokens.df <- convert(test.tokens.dfm, to='data.frame')
+names(test.tokens.df) <- make.names(names(test.tokens.df))
+
+
+test.svd.raw <- t(sigma.inverse * u.transpose %*% t(test.tfidf))
+test.svd <- data.frame(as.matrix(test.svd.raw))
+
+test.svd.eng <- test.svd %>% 
+  mutate(
+    month = test.pre$time_month,
+    word_count = test.pre$word_count,
+    exclaim_count = test.pre$exclaim_count,
+    question_count = test.pre$question_count,
+    char_count = test.pre$char_count,
+    char_per_word = test.pre$char_per_word,
+    rating = test.pre$rating
+  )
+
+## Adding engineered features to separate training set
+
+test.tfidf.df.eng <- test.tfidf.df %>% 
+  mutate(
+    month = test.pre$time_month,
+    word_count = test.pre$word_count,
+    exclaim_count = test.pre$exclaim_count,
+    question_count = test.pre$question_count,
+    char_count = test.pre$char_count,
+    char_per_word = test.pre$char_per_word,
+    rating = test.pre$rating
+  )
+
+
+```
+
+
+
+
+
+## Evaluate
+
+#### Confusion Matrix for train set
+
+
+``` {r}
+
+# Naive Bayes
+nb.predicted <- predict(model.nb, train.tokens.dfm)
+confusionMatrix(train$isHelpful, nb.predicted)
+
+
+# Support Vector Machine
+svm.predicted <- predict(svm.linear, train.svd)
+confusionMatrix(train.svd$Label, svm.predicted)
+
+# Single Tree
+rpart.predicted <- predict(rpart.cv, train.tfidf.df)
+confusionMatrix(train.labels, rpart.predicted)
+
+# Support Vector Machine
+svm.predicted.eng <- predict(svm.linear, train.svd.eng)
+confusionMatrix(train.svd.eng$Label, svm.predicted.eng)
+
+# Single Tree
+rpart.predicted.eng <- predict(rpart.cv.eng, train.tfidf.df.eng)
+confusionMatrix(train.tfidf.df$Label, rpart.predicted.eng)
+
+
+# Random Forest
+# confusionMatrix(train.svd$Label, randforr.cv$finalModel$predicted)
+
+```
+
+
+#### Confusion Matrix for Test Set 
+
+Specificity is the most important metric to me - I want to be able to accurately predict is a review is going to be helpful, so I can alter it's appearance in the UI. A single decision tree had the highest specifity at 53.9% and overall accuracy of 60.3%. As a PM, this isn't high enough for me to hide all reviews entirely, but maybe highlight a few which we have high confidence in. 
+
+
+``` {r}
+
+# Naive Bayes
+nb.predicted.test <- predict(model.nb, newdata = dfm_match(test.tokens.dfm, features = featnames(train.tokens.dfm)))
+confusionMatrix(test.labels, nb.predicted.test)
+
+# Support Vector Machine
+svm.predicted.test <- predict(svm.linear, test.svd)
+confusionMatrix(test.labels, svm.predicted.test)
+
+# Single Tree
+rpart.predicted.test <- predict(rpart.cv, test.tfidf.df)
+confusionMatrix(test.labels, rpart.predicted.test)
+
+# # Random Forest
+# randforr.predicted.test <- predict(randforr.cv, test.svd)
+# confusionMatrix(test.labels, randforr.predicted.test)
+
+# Support Vector Machine - Engineered Features
+svm.predicted.test.eng <- predict(svm.linear.eng, test.svd.eng)
+confusionMatrix(test.labels, svm.predicted.test)
+
+# Single Tree - Engineered Features
+rpart.predicted.test.eng <- predict(rpart.cv.eng, test.tfidf.df.eng)
+confusionMatrix(test.labels, rpart.predicted.test.eng)
+
+
+
+
+```
+
+
+
+
+
+
+
+
+

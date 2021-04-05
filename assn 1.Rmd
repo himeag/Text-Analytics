@@ -1,0 +1,298 @@
+---
+title: "Assn 1 - mtessmann"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(quanteda)
+library(skimr)
+reviews_raw <- read_csv("deceptive-opinion.csv")
+reviews <- reviews_raw %>% 
+  mutate(
+    deceptive = factor(deceptive),
+    polarity = factor(polarity)
+  )
+skim(reviews)
+levels(reviews$deceptive)
+```
+
+```{r}
+#1. Google how to randomly sample 500 observations from the dataset. 
+# Then select only the truthful reviews and check if the length of the reviews 
+# differ across positive and negative reviews. Do the same for deceptive reviews.
+
+samples = reviews[sample(nrow(reviews), 500),]
+
+samples %>% 
+  filter(deceptive == 'truthful') %>% 
+  ggplot(aes(polarity, nchar(text))) + 
+  geom_boxplot()
+
+samples %>% 
+  filter(deceptive == 'deceptive') %>% 
+  ggplot(aes(polarity, nchar(text))) + 
+  geom_boxplot()
+
+```
+
+```{r}
+#2: Tokenize the ‘text’ variable, removing punctuations, symbols, hyphens and numbers,
+    # and convert it into a Document Term Matrix
+reviews_tokens <- tokens(reviews$text, what='word',
+                         remove_punct = TRUE,
+                         remove_numbers = TRUE,
+                         remove_symbols = TRUE,
+                         split_hyphens=TRUE)
+
+reviews_dfm <- reviews_tokens %>% 
+  dfm()
+
+```
+
+```{r}
+# 3. Check the dimensions and sparsity of the DFM, view the first five rows and columns
+
+dim(reviews_dfm)
+head(reviews_dfm, n=5, nf=5)
+
+# 9651 rows
+# 36% sparce
+
+```
+
+```{r}
+#4) Repeat the same analysis as 1) and 2) but now remove stopwords, stem the words,
+# change to lower case. Do you see a difference in dimensions and sparsity?
+
+reviews_stemmed_dfm <- reviews_tokens %>% 
+  tokens_remove(stopwords(source='smart')) %>% 
+  tokens_wordstem() %>% 
+  tokens_tolower() %>% 
+  dfm()
+
+
+reviews_tokens_matrix <-as.matrix(reviews_stemmed_dfm)
+
+dim(reviews_stemmed_dfm)
+colnames(reviews_tokens_matrix)
+head(reviews_stemmed_dfm, n=5, nf=5)
+
+# 6440 rows
+# 72% sparce
+# removing stopwords, wordstemming, and lower casing reducing the length of the dfm and increases sparcity
+
+```
+
+```{r}
+# 5) Create a bar plot for most frequent words after preprocessing the original file with library tidytext
+
+reviews_tokens_unnested <- reviews %>% 
+  unnest_tokens(word, text)
+
+head(reviews_tokens_unnested)
+data("stop_words")
+
+reviews_tokens_unnested <- reviews_tokens_unnested %>%
+  anti_join(stop_words)
+
+reviews_tokens_unnested %>% 
+  count(word, ) %>% 
+  top_n(., 15) %>% 
+  mutate(word=reorder(word, n)) %>% 
+  ggplot(aes(word, n)) + 
+  geom_col() + 
+  xlab(NULL) + 
+  coord_flip()
+
+
+
+```
+
+```{r}
+#6)Perform a tokens-per-document analysis on the entire DTM created 
+# in step 4 and plot a histogram
+
+token_freq <- textstat_frequency(reviews_stemmed_dfm, n=100)
+head(token_freq, 10)
+
+token_freq_sums <- data.frame(rowSums(reviews_stemmed_dfm))
+colnames(token_freq_sums)<-"Freq"
+summary(token_freq_sums)
+
+ggplot(token_freq_sums, aes(Freq)) + 
+  geom_histogram(binwidth=2) + 
+  labs(y="Number of Documents",
+       x="Tokens Count per Document",
+       title="Distribution of Tokens per Document")
+```
+
+```{r}
+#7) Create a comparative wordcloud for the groups 'truthful' vs 'deceptive'
+
+reviews_cloud <- corpus(reviews, text_field = 'text')
+dfm_cloud <- dfm(
+  reviews_cloud, 
+  remove = stopwords('english'), 
+  remove_punct = TRUE,
+  groups = 'deceptive') %>% 
+  dfm_trim(min_termfreq = 3)
+
+textplot_wordcloud(
+  dfm_cloud, 
+  comparison = TRUE, 
+  max_words = 200,
+  min_size = 0.5,
+  max_size = 4,
+  min_count = 3,
+  color = c("red", "blue")
+)
+
+tstat_cloud_keyness <- textstat_keyness(dfm_cloud, target="truthful")
+textplot_keyness(tstat_cloud_keyness, margin=.01, n=10)
+# textplot_wordcloud(
+#   reviews_stemmed_dfm,
+#   min_size = 0.5,
+#   max_size = 4,
+#   min_count = 3,
+#   max_words = 200,
+#   color = "darkblue",
+#   font = NULL,
+#   adjust = 0,
+#   rotation = 0.1,
+#   random_order = FALSE,
+#   random_color = FALSE,
+#   ordered_color = FALSE,
+#   labelcolor = "gray20",
+#   labelsize = 1.5,
+#   labeloffset = 0,
+#   fixed_aspect = TRUE,
+#   comparison = FALSE
+# )
+
+```
+
+```{r}
+#8) Create both unigrams and bigrams on the original dataset and compare the number of dimensions
+# and sparsity across the datasets.
+
+reviews_tokens_ngrams <- tokens(reviews$text,
+                                what='word',
+                                remove_numbers = TRUE,
+                                remove_punct = TRUE,
+                                remove_symbols = TRUE,
+                                split_hyphens = TRUE)
+
+
+reviews_tokens_ngrams <- reviews_tokens_ngrams %>% 
+  tokens_remove(stopwords(source = 'smart')) %>% 
+  tokens_wordstem() %>% 
+  tokens_tolower()
+
+
+reviews_ngrams <- reviews_tokens_ngrams %>% 
+  tokens_ngrams(n=1:2) %>% 
+  dfm()
+reviews_ngrams[1:3, 65000:65015]
+
+sparsity(reviews_ngrams)
+dim(reviews_ngrams)
+
+# 65518 rows
+# 99.84% sparcity
+# sparcity and rows both drammatically increased
+```
+
+```{r}
+#9) Create a wordcloud for the bigrams
+
+reviews_bigrams <- reviews_tokens_ngrams %>% 
+  tokens_ngrams(n=2) %>% 
+  dfm()
+
+textplot_wordcloud(
+  reviews_bigrams, 
+  min_size = 0.5,
+  max_size = 4,
+  min_count = 3,
+  max_words = 200,
+  color = "darkblue",
+  font = NULL,
+  adjust = 0,
+  rotation = 0.1,
+  random_order = FALSE,
+  random_color = FALSE,
+  ordered_color = FALSE,
+  labelcolor = "gray20",
+  labelsize = 1.5,
+  labeloffset = 0,
+  fixed_aspect = TRUE,
+  comparison = FALSE
+)
+
+
+```
+
+```{r}
+# 10) Create a customized bigram wordcloud for the most frequently occurring 
+# word in the previous step.
+
+hotel_ngrams <- reviews_tokens_ngrams %>% 
+  tokens_ngrams(n=2)
+
+hotel_bigram <- tokens_compound(hotel_ngrams, phrase("hotel*"))
+hotel_bigram <- tokens_select(hotel_bigram, phrase("hotel_*"))
+hotel_bigram <- dfm(hotel_bigram)
+
+textplot_wordcloud(
+  hotel_bigram, 
+  min_size = 0.5, 
+  max_size = 4,
+  min_count = 3, 
+  max_words = 200, 
+  color = "darkblue", 
+  font = NULL,
+  adjust = 0, 
+  rotation = 0.1, random_order = FALSE, random_color = FALSE,
+  ordered_color = FALSE, 
+  labelcolor = "gray20", 
+  labelsize = 1.5,
+  labeloffset = 0, 
+  fixed_aspect = TRUE, 
+  comparison = FALSE
+)
+
+```
+
+```{r}
+#11) Preprocess the original dataset and perform a TFIDF weighting on it,
+# then create a bar plot for most frequent words using library ggplot2.
+
+tfidf <- dfm_tfidf(reviews_stemmed_dfm, scheme_tf = 'prop', scheme_df = 'inverse', base = 10)
+tfidf[1:5,1:5]
+
+tokenfreq_tfidf <-textstat_frequency(tfidf, n=100, force=TRUE)#Uses Quanteda
+
+tokenfreq_tfidf %>% 
+  filter(rank<10) %>% 
+  mutate(rank = reorder(rank,frequency)) %>% 
+  ggplot(aes(feature, frequency)) +
+    geom_col() +
+    labs(y = "Cumulative Frequency", x = "Words",
+         title = "Most Frequent Words after TFIDF")
+
+
+
+```
+
+
+
+``` {r}
+raw1 <- corpus(reviews_raw, text_field = 'text')
+
+dfmat2 <- dfm(raw1, remove=stopwords('english'), remove_punct=TRUE, groups = 'deceptive') %>% 
+  dfm_trim(min_termfreq = 3)
+tstat1
+
+
+```
